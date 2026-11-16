@@ -17,9 +17,9 @@ A Streamlit app that estimates the **cost of equity, cost of debt and WACC** for
 | Input | Source |
 |---|---|
 | U.S. industry unlevered betas | [Damodaran – betas.xls](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls) |
-| Corporate tax rates (combined statutory) | [OECD Corporate Tax Statistics 2024](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) |
+| Corporate tax rates (combined statutory) | [OECD Corporate Tax Statistics](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html), read from the OECD Data API (dataflow `DSD_TAX_CIT@DF_CIT`), latest tax year |
 | USD BBB spread (Baa2/BBB, large non-financial firms) | [Damodaran – ratings.html](https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/ratings.html) |
-| 10-year government bond yields | [Trading Economics – Bonds](https://tradingeconomics.com/bonds) (scraped, no API key) |
+| 10-year government bond yields | [Trading Economics – Bonds](https://tradingeconomics.com/bonds) (scraped, no API key). If blocked: [FRED](https://fred.stlouisfed.org/series/DGS10) U.S. 10Y Treasury (daily) and OECD long-term government bond yields (monthly) |
 
 ## Methodology
 
@@ -58,7 +58,7 @@ streamlit run app.py
 ## Limitations
 
 - **Scraping is fragile.** If a source changes its page layout, the parser can stop working. In that case the app shows a warning and uses **clearly labeled fallback values**. Use **Refresh data** or the manual overrides.
-- **Trading Economics loads its tables with JavaScript and may block cloud servers.** The fallback yields are approximate (mid-2026), so override them with current values if the live fetch fails.
-- **The OECD page may not expose a plain HTML table.** If it doesn't, the app uses a built-in table of OECD 2024 combined statutory rates.
+- **Trading Economics loads its tables with JavaScript and blocks most cloud servers.** In that case the app pulls live 10Y yields from FRED: daily for the U.S., and the latest monthly OECD average for other countries. Countries FRED doesn't cover (e.g., Brazil, China, Turkey) use approximate built-in values, and each yield shows its source and date.
+- **The OECD report page returns 403 to scripts.** The app reads the same data from the OECD Data API instead, and uses a built-in OECD 2024 table only if the API also fails.
 - **The fallback betas are an approximate subset of industries.** Rely on the live Damodaran file for exact values and the full list of industries.
 - **Model simplifications:** no country risk premium or sovereign-default adjustment, U.S. betas applied globally, and constant target weights. This is an educational tool, not investment advice.
