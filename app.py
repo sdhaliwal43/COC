@@ -13,6 +13,7 @@ Live data sources (with labeled fallbacks if a fetch fails):
 
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import numpy as np
@@ -276,9 +277,59 @@ def fetch_betas() -> dict:
         }
 
 
+OECD_CIT_APIS = [
+    # OECD Data API (SDMX) - same Corporate Tax Statistics database behind the report.
+    "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,/all"
+    "?startPeriod=2020&dimensionAtObservation=AllDimensions&format=csvfilewithlabels",
+    "https://sdmx.oecd.org/public/rest/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/all"
+    "?startPeriod=2020&dimensionAtObservation=AllDimensions&format=csvfilewithlabels",
+]
+
+
+def _parse_oecd_cit_csv(text: str) -> tuple[dict, int]:
+    """Pick the combined (central + sub-central) statutory CIT rate, latest year per country."""
+    df = pd.read_csv(io.StringIO(text))
+    ccol = "Reference area" if "Reference area" in df.columns else "REF_AREA"
+    vcol = "OBS_VALUE" if "OBS_VALUE" in df.columns else df.columns[-1]
+    tcol = "TIME_PERIOD" if "TIME_PERIOD" in df.columns else None
+    skip = {ccol, "REF_AREA", vcol, tcol, "Time period", "Observation value"}
+    label_cols = [c for c in df.columns
+                  if c not in skip and not pd.api.types.is_numeric_dtype(df[c])]
+    labels = df[label_cols].fillna("").astype(str).agg(" | ".join, axis=1).str.lower()
+    mask = labels.str.contains("combined") & ~labels.str.contains(
+        "targeted|small business|less deductions|exclusive of surtax", regex=True
+    )
+    sub = df[mask].copy()
+    sub["_v"] = pd.to_numeric(sub[vcol], errors="coerce")
+    sub["_t"] = pd.to_numeric(sub[tcol], errors="coerce") if tcol else 0
+    sub["_c"] = sub[ccol].map(normalize_country)
+    sub = sub.dropna(subset=["_v", "_c"]).sort_values("_t")
+    latest = sub.groupby("_c").tail(1)
+    rates = {c: v / 100 for c, v in zip(latest["_c"], latest["_v"]) if 0 <= v <= 60}
+    year = int(latest["_t"].max()) if len(latest) else 0
+    us = rates.get("United States")
+    if us is None or not 0.15 <= us <= 0.35 or len(rates) < 20:
+        raise ValueError("Combined CIT rate series not found in OECD API response")
+    return rates, year
+
+
 @st.cache_data(ttl=86400, show_spinner="Fetching OECD corporate tax rates…")
 def fetch_tax_rates() -> dict:
     fetched_at = now_str()
+    errors = []
+    # 1) OECD Data API (reliable, machine-readable)
+    for api in OECD_CIT_APIS:
+        try:
+            r = get(api)
+            rates, year = _parse_oecd_cit_csv(r.text)
+            return {
+                "data": rates, "as_of": f"OECD Corporate Tax Statistics – tax year {year}",
+                "fetched_at": fetched_at, "status": "Fetched", "error": None,
+                "note": "Combined (central + sub-central) statutory CIT rate, via OECD Data API",
+            }
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"OECD API: {e}")
+    # 2) The report web page (often 403 / JavaScript-rendered for scripts)
     try:
         r = get(TAX_URL)
         tables = pd.read_html(io.StringIO(r.text))
@@ -290,34 +341,32 @@ def fetch_tax_rates() -> dict:
             countries = t[t.columns[0]].map(normalize_country)
             if not countries.eq("United States").any():
                 continue
-            numeric_cols = [
-                c for c in t.columns[1:]
-                if t[c].map(to_float).notna().mean() > 0.6
-            ]
+            numeric_cols = [c for c in t.columns[1:] if t[c].map(to_float).notna().mean() > 0.6]
             if not numeric_cols:
                 continue
             col = next((c for c in numeric_cols if "combined" in str(c).lower()), numeric_cols[-1])
             vals = t[col].map(to_float)
-            us = vals[countries.eq("United States")].iloc[0]
-            if not 15 <= us <= 35:   # sanity check: U.S. combined rate is ~25.8%
+            if not 15 <= vals[countries.eq("United States")].iloc[0] <= 35:
                 continue
             for c, v in zip(countries, vals):
                 if c and pd.notna(v) and 0 <= v <= 60:
                     rates.setdefault(c, v / 100)
         if len(rates) < 20:
-            raise ValueError("OECD page did not contain a parseable rate table (likely JS-rendered)")
+            raise ValueError("no parseable rate table")
         return {
             "data": rates, "as_of": "OECD Corporate Tax Statistics 2024",
             "fetched_at": fetched_at, "status": "Fetched", "error": None,
             "note": "Combined (central + sub-central) statutory CIT rate",
         }
     except Exception as e:  # noqa: BLE001
-        return {
-            "data": {k: v / 100 for k, v in FALLBACK_TAX.items()},
-            "as_of": "OECD Corporate Tax Statistics 2024 (fallback table)",
-            "fetched_at": fetched_at, "status": "Fallback", "error": str(e),
-            "note": "Built-in combined statutory CIT rates",
-        }
+        errors.append(f"OECD report page: {e}")
+    # 3) Built-in table
+    return {
+        "data": {k: v / 100 for k, v in FALLBACK_TAX.items()},
+        "as_of": "OECD Corporate Tax Statistics 2024 (fallback table)",
+        "fetched_at": fetched_at, "status": "Fallback", "error": " | ".join(errors),
+        "note": "Built-in combined statutory CIT rates",
+    }
 
 
 @st.cache_data(ttl=86400, show_spinner="Fetching Damodaran BBB spread…")
@@ -367,39 +416,114 @@ def fetch_bbb_spread() -> dict:
     }
 
 
-@st.cache_data(ttl=86400, show_spinner="Fetching Trading Economics 10Y yields…")
-def fetch_bond_yields() -> dict:
-    fetched_at = now_str()
+# FRED series used when Trading Economics blocks the request. No API key needed.
+# U.S.: daily 10Y Treasury (DGS10). Others: OECD long-term (10Y) government bond yields, monthly.
+FRED_CSV = "https://fred.stlouisfed.org/graph/fredgraph.csv?id={}"
+FRED_SERIES = {"United States": "DGS10"} | {
+    country: f"IRLTLT01{code}M156N" for country, code in {
+        "Germany": "DE", "United Kingdom": "GB", "France": "FR", "Italy": "IT", "Spain": "ES",
+        "Japan": "JP", "Canada": "CA", "Australia": "AU", "Mexico": "MX", "South Korea": "KR",
+        "Switzerland": "CH", "Netherlands": "NL", "Ireland": "IE", "Belgium": "BE",
+        "Austria": "AT", "Sweden": "SE", "Norway": "NO", "Denmark": "DK", "Finland": "FI",
+        "Portugal": "PT", "Greece": "GR", "Poland": "PL", "Czech Republic": "CZ",
+        "Hungary": "HU", "Israel": "IL", "New Zealand": "NZ", "South Africa": "ZA",
+        "Chile": "CL", "Colombia": "CO", "Iceland": "IS", "Slovakia": "SK", "Slovenia": "SI",
+        "Lithuania": "LT", "Latvia": "LV", "Luxembourg": "LU", "India": "IN",
+    }.items()
+}
+
+
+def _fred_latest(series_id: str) -> tuple[float, str]:
+    r = get(FRED_CSV.format(series_id))
+    df = pd.read_csv(io.StringIO(r.text))
+    df.columns = ["date", "value"]
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df = df.dropna()
+    last = df.iloc[-1]
+    return float(last["value"]) / 100, str(last["date"])
+
+
+def _scrape_trading_economics() -> dict:
+    r = get(BONDS_URL)
+    yields: dict[str, float] = {}
     try:
-        r = get(BONDS_URL)
         tables = pd.read_html(io.StringIO(r.text))
-        yields: dict[str, float] = {}
-        for t in tables:
-            if t.shape[1] < 2:
-                continue
-            ycol = next(
-                (c for c in t.columns if str(c).strip().lower() in ("yield", "price", "last")),
-                t.columns[1],
-            )
-            for name, y in zip(t[t.columns[0]], t[ycol]):
-                c = normalize_country(str(name))
-                v = to_float(y)
+    except ValueError:
+        tables = []
+    for t in tables:
+        if t.shape[1] < 2:
+            continue
+        ycol = next(
+            (c for c in t.columns if str(c).strip().lower() in ("yield", "price", "last")),
+            t.columns[1],
+        )
+        for name, y in zip(t[t.columns[0]], t[ycol]):
+            c, v = normalize_country(str(name)), to_float(y)
+            if c and pd.notna(v) and -5 < v < 100:
+                yields.setdefault(c, v / 100)
+    if not tables:  # rows may sit outside <table> tags
+        soup = BeautifulSoup(r.text, "html.parser")
+        for tr in soup.select("tr"):
+            cells = [td.get_text(" ", strip=True) for td in tr.find_all(["td", "th"])]
+            if len(cells) >= 2:
+                c, v = normalize_country(cells[0]), to_float(cells[1])
                 if c and pd.notna(v) and -5 < v < 100:
                     yields.setdefault(c, v / 100)
-        if "United States" not in yields or len(yields) < 10:
-            raise ValueError("Could not parse the bond yield tables")
+    if "United States" not in yields or len(yields) < 10:
+        raise ValueError("No bond yield table in the page (blocked or JavaScript-rendered)")
+    return yields
+
+
+@st.cache_data(ttl=86400, show_spinner="Fetching 10Y government bond yields…")
+def fetch_bond_yields() -> dict:
+    """Trading Economics first; if blocked, FRED (U.S. Treasury daily + OECD monthly);
+    any country still missing uses the built-in table. Each country records its source."""
+    fetched_at = now_str()
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # 1) Trading Economics
+    try:
+        te = _scrape_trading_economics()
         return {
-            "data": yields, "as_of": datetime.now(timezone.utc).strftime("%Y-%m-%d") + " (scrape date)",
-            "fetched_at": fetched_at, "status": "Fetched", "error": None,
-            "note": "Latest 10-year government bond yields",
+            "data": te, "by_country": {c: ("Trading Economics", today) for c in te},
+            "as_of": f"{today} (scrape date)", "fetched_at": fetched_at, "status": "Fetched",
+            "error": None, "note": "Latest 10-year government bond yields", "source": "Trading Economics",
+            "url": BONDS_URL,
         }
     except Exception as e:  # noqa: BLE001
+        te_error = f"Trading Economics: {e}"
+
+    # 2) FRED (parallel downloads)
+    data, by_country, errs = {}, {}, []
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = {pool.submit(_fred_latest, sid): c for c, sid in FRED_SERIES.items()}
+        for fut in as_completed(futures):
+            c = futures[fut]
+            try:
+                v, d = fut.result()
+                data[c], by_country[c] = v, ("FRED", d)
+            except Exception as e:  # noqa: BLE001
+                errs.append(f"{c}: {e}")
+    if "United States" in data and len(data) >= 10:
+        for c, v in FALLBACK_YIELDS.items():          # fill countries FRED doesn't cover
+            if c not in data:
+                data[c], by_country[c] = v / 100, ("Built-in fallback", "approx. mid-2026")
+        us_date = by_country["United States"][1]
         return {
-            "data": {k: v / 100 for k, v in FALLBACK_YIELDS.items()},
-            "as_of": "Approximate fallback values (mid-2026)",
-            "fetched_at": fetched_at, "status": "Fallback", "error": str(e),
-            "note": "Built-in approximate 10Y yields",
+            "data": data, "by_country": by_country,
+            "as_of": f"U.S. daily as of {us_date}; other countries = latest monthly OECD average",
+            "fetched_at": fetched_at, "status": "Fetched (FRED)", "error": te_error,
+            "note": "Trading Economics blocked this server, so FRED / OECD 10Y yields are used",
+            "source": "FRED (St. Louis Fed) / OECD", "url": "https://fred.stlouisfed.org/series/DGS10",
         }
+
+    # 3) Built-in table
+    return {
+        "data": {k: v / 100 for k, v in FALLBACK_YIELDS.items()},
+        "by_country": {c: ("Built-in fallback", "approx. mid-2026") for c in FALLBACK_YIELDS},
+        "as_of": "Approximate fallback values (mid-2026)", "fetched_at": fetched_at,
+        "status": "Fallback", "error": te_error + " | FRED: " + "; ".join(errs[:3]),
+        "note": "Built-in approximate 10Y yields", "source": "Trading Economics", "url": BONDS_URL,
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -495,14 +619,24 @@ tax_choice = st.sidebar.radio(
     ["U.S. tax rate", "Selected-country tax rate"], index=0, horizontal=True,
 )
 
+def yld_country_status(c: str) -> str:
+    src = yld_src.get("by_country", {}).get(c, ("", ""))[0]
+    return "Fallback" if (src == "Built-in fallback" or yld_src["status"] == "Fallback") else "Fetched"
+
+
+def yld_label(c: str) -> str:
+    src, d = yld_src.get("by_country", {}).get(c, (yld_src.get("source", ""), ""))
+    return f" ({src}, {d})" if src else ""
+
+
 fetched_beta = float(betas_df.loc[betas_df["Industry"] == industry, "Unlevered beta"].iloc[0])
 fetched = {
     "beta": (fetched_beta, betas_src["status"]),
     "tax_us": (tax_rates["United States"], tax_src["status"]),
     "tax_fc": (tax_rates[country], tax_src["status"]),
     "spread_us": (bbb_src["data"], bbb_src["status"]),
-    "rf_us": (yields["United States"], yld_src["status"]),
-    "rf_fc": (yields[country], yld_src["status"]),
+    "rf_us": (yields["United States"], yld_country_status("United States")),
+    "rf_fc": (yields[country], yld_country_status(country)),
 }
 
 
@@ -547,7 +681,7 @@ fc_ccy = currency_of(country)
 
 
 def status(manual: bool, src_status: str) -> str:
-    return "✏️ Manual" if manual else ("🟢 Fetched" if src_status == "Fetched" else "🟡 Fallback")
+    return "✏️ Manual" if manual else ("🟢 Fetched" if src_status.startswith("Fetched") else "🟡 Fallback")
 
 
 inputs_df = pd.DataFrame([
@@ -558,8 +692,10 @@ inputs_df = pd.DataFrame([
     [f"{country} corporate tax rate", pct(tax_fc), status(m_tax_fc, fetched["tax_fc"][1])],
     ["Project tax rate used", f"{pct(t)} ({tax_label})", "Selected"],
     ["USD BBB spread", pct(spread_us), status(m_spread_us, fetched["spread_us"][1])],
-    ["U.S. 10Y yield", pct(rf_us), status(m_rf_us, fetched["rf_us"][1])],
-    [f"{country} 10Y yield", pct(rf_fc), status(m_rf_fc, fetched["rf_fc"][1])],
+    ["U.S. 10Y yield", pct(rf_us) + ("" if m_rf_us else yld_label("United States")),
+     status(m_rf_us, fetched["rf_us"][1])],
+    [f"{country} 10Y yield", pct(rf_fc) + ("" if m_rf_fc else yld_label(country)),
+     status(m_rf_fc, fetched["rf_fc"][1])],
     [f"{country} BBB spread", pct(spread_fc), "✏️ Manual" if m_spread_fc else "🧮 Auto-calculated"],
     ["Equity risk premium", pct(erp), "Selected"],
     ["Debt share D/(D+E)", pct(wd, 0), "Selected"],
@@ -572,8 +708,8 @@ sources_df = pd.DataFrame([
      tax_src["fetched_at"], tax_src["status"], tax_src["note"], TAX_URL],
     ["USD BBB spread", "Damodaran (NYU Stern)", bbb_src["as_of"], bbb_src["fetched_at"],
      bbb_src["status"], f"{bbb_src['note']}: {pct(bbb_src['data'])}", bbb_src["url"]],
-    ["10Y government yields", "Trading Economics", yld_src["as_of"], yld_src["fetched_at"],
-     yld_src["status"], yld_src["note"], BONDS_URL],
+    ["10Y government yields", yld_src["source"], yld_src["as_of"], yld_src["fetched_at"],
+     yld_src["status"], yld_src["note"], yld_src["url"]],
 ], columns=["Data", "Source", "As of", "Fetched at", "Status", "Notes", "URL"])
 
 # --------------------------------------------------------------------------------------
@@ -589,7 +725,12 @@ st.markdown(
 
 for name, src in (("Betas", betas_src), ("Tax rates", tax_src),
                   ("BBB spread", bbb_src), ("Bond yields", yld_src)):
-    if src["status"] != "Fetched":
+    if src["status"] == "Fetched (FRED)":
+        st.info("**Bond yields:** Trading Economics blocked the request from this server, so live "
+                "10Y yields come from FRED (U.S. Treasury daily; other countries = latest OECD monthly "
+                "average). Countries FRED doesn't cover use labeled fallback values. Override any yield "
+                "in the sidebar if needed.")
+    elif src["status"] != "Fetched":
         st.warning(f"**{name}:** live fetch failed, so labeled fallback values are in use. "
                    f"Use *Refresh data* or the manual overrides. _(Detail: {src['error']})_")
 
